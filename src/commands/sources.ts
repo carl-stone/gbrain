@@ -628,8 +628,9 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   console.log('');
   for (const m of metrics) {
     const warns: string[] = [];
-    if (!m.local_path) warns.push('no local_path');
-    if (m.lag_seconds === null) warns.push(`never synced — run \`gbrain sync --source ${m.source_id}\``);
+    const emptySeedDefault = m.source_id === 'default' && !m.local_path && m.total_pages === 0;
+    if (!emptySeedDefault && !m.local_path) warns.push('no local_path');
+    if (!emptySeedDefault && m.lag_seconds === null) warns.push(`never synced — run \`gbrain sync --source ${m.source_id}\``);
     if (m.embed_coverage_pct < 95 && m.total_chunks > 100) {
       warns.push(`${(100 - m.embed_coverage_pct).toFixed(1)}% un-embedded — run \`gbrain embed --stale --source ${m.source_id}\``);
     }
