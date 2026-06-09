@@ -21,6 +21,8 @@ import type {
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
+import { executeRawJsonb } from './sql-query.ts';
+import { stripNul, buildLinkRows, buildTimelineRows, buildTakeRows } from './batch-rows.ts';
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
 import { verifySchema } from './schema-verify.ts';
@@ -893,13 +895,21 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Pages CRUD
-  async getPage(slug: string, opts?: { sourceId?: string; includeDeleted?: boolean }): Promise<Page | null> {
+  async getPage(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Page | null> {
     const sql = this.sql;
     const includeDeleted = opts?.includeDeleted === true;
     const sourceId = opts?.sourceId;
-    // v0.26.5: default hides soft-deleted rows. Compose with optional sourceId
+    const sourceIds = opts?.sourceIds;
+    // v0.26.5: default hides soft-deleted rows. Compose with optional source
     // filter via fragment chaining (postgres.js supports sql`` composition).
-    const sourceCondition = sourceId ? sql`AND source_id = ${sourceId}` : sql``;
+    // #1393: a federated grant (sourceIds[]) takes precedence over scalar
+    // sourceId so the exact-match read honors allowedSources, not just one source.
+    const sourceCondition =
+      sourceIds && sourceIds.length > 0
+        ? sql`AND source_id = ANY(${sourceIds}::text[])`
+        : sourceId
+          ? sql`AND source_id = ${sourceId}`
+          : sql``;
     const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
     const rows = await sql`
       SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
@@ -2509,7 +2519,7 @@ export class PostgresEngine implements BrainEngine {
     await sql`
       INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
       SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field
-      FROM (VALUES (${from}, ${to}, ${linkType || ''}, ${context || ''}, ${src}, ${originSlug ?? null}, ${originField ?? null}, ${fromSrc}, ${toSrc}, ${originSrc}))
+      FROM (VALUES (${from}, ${to}, ${linkType || ''}, ${stripNul(context || '')}, ${src}, ${originSlug ?? null}, ${originField ?? null}, ${fromSrc}, ${toSrc}, ${originSrc}))
         AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id)
       JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
       JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
@@ -2526,42 +2536,33 @@ export class PostgresEngine implements BrainEngine {
   }
 
   private async _addLinksBatchOnce(links: LinkBatchInput[]): Promise<number> {
-    const sql = this.sql;
-    // unnest() pattern: 7 array-typed bound parameters regardless of batch size.
-    // Avoids the 65535-parameter cap and the postgres-js sql(rows, ...) helper's
-    // identifier-escape gotcha when used inside a (VALUES) subquery.
-    //
-    // v0.13: added link_source, origin_slug, origin_field. Defaults:
-    //   link_source  → 'markdown' (back-compat with pre-v0.13 callers)
-    //   origin_slug  → NULL (resolves to origin_page_id IS NULL via LEFT JOIN)
-    //   origin_field → NULL
-    const fromSlugs = links.map(l => l.from_slug);
-    const toSlugs = links.map(l => l.to_slug);
-    const linkTypes = links.map(l => l.link_type || '');
-    const contexts = links.map(l => l.context || '');
-    const linkSources = links.map(l => l.link_source || 'markdown');
-    const originSlugs = links.map(l => l.origin_slug || null);
-    const originFields = links.map(l => l.origin_field || null);
-    const fromSourceIds = links.map(l => l.from_source_id || 'default');
-    const toSourceIds = links.map(l => l.to_source_id || 'default');
-    const originSourceIds = links.map(l => l.origin_source_id || 'default');
-    // v0.41.18.0 (A10): link_kind column (v98). NULL = legacy/plain.
-    const linkKinds = links.map(l => l.link_kind ?? null);
-    const result = await sql`
-      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field)
-      SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field
-      FROM unnest(
-        ${fromSlugs}::text[], ${toSlugs}::text[], ${linkTypes}::text[],
-        ${contexts}::text[], ${linkSources}::text[], ${originSlugs}::text[],
-        ${originFields}::text[], ${fromSourceIds}::text[], ${toSourceIds}::text[],
-        ${originSourceIds}::text[], ${linkKinds}::text[]
-      ) AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id, link_kind)
-      JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
-      JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
-      LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
-      ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO NOTHING
-      RETURNING 1
-    `;
+    // #1861: pass the batch as one JSONB document via jsonb_to_recordset instead
+    // of N parallel unnest(${arr}::text[]). The old text[] array-literal path
+    // crashed Postgres ("malformed array literal") on free-text context strings
+    // (calendar/Zoom lines with commas, quotes, braces, em-dashes); JSONB encodes
+    // arbitrary text safely and dodges the 65535-param cap. Binding goes through
+    // executeRawJsonb (the audited cross-engine JSONB contract) with an OBJECT
+    // wrapper { rows } — a bare top-level array through postgres.js would re-enter
+    // the same array serializer this fix exists to avoid. Row construction +
+    // NUL-stripping + exact defaulting live in buildLinkRows (shared with PGLite).
+    const rows = buildLinkRows(links);
+    const result = await executeRawJsonb(
+      this,
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field)
+       SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field
+       FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(
+         from_slug text, to_slug text, link_type text, context text, link_source text,
+         origin_slug text, origin_field text, from_source_id text, to_source_id text,
+         origin_source_id text, link_kind text
+       )
+       JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
+       JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
+       LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
+       ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO NOTHING
+       RETURNING 1`,
+      [],
+      [{ rows }],
+    );
     return result.length;
   }
 
@@ -2668,6 +2669,30 @@ export class PostgresEngine implements BrainEngine {
       WHERE t.slug = ${slug}
     `;
     return rows as unknown as Link[];
+  }
+
+  async listLinkSources(
+    opts?: { sourceId?: string; sourceIds?: string[] },
+  ): Promise<{ link_source: string | null; count: number }[]> {
+    const sql = this.sql;
+    // v114 (#1941): distinct provenances + counts for `gbrain link-sources`.
+    // Scope by the FROM page's source (consistent with getLinks). Federated
+    // {sourceIds} takes precedence over scalar {sourceId}; neither = unscoped.
+    const sourceCondition =
+      opts?.sourceIds && opts.sourceIds.length > 0
+        ? sql`WHERE f.source_id = ANY(${opts.sourceIds}::text[])`
+        : opts?.sourceId
+          ? sql`WHERE f.source_id = ${opts.sourceId}`
+          : sql``;
+    const rows = await sql`
+      SELECT l.link_source, COUNT(*)::int AS count
+      FROM links l
+      JOIN pages f ON f.id = l.from_page_id
+      ${sourceCondition}
+      GROUP BY l.link_source
+      ORDER BY count DESC, l.link_source ASC NULLS LAST
+    `;
+    return rows as unknown as { link_source: string | null; count: number }[];
   }
 
   async findByTitleFuzzy(
@@ -2931,6 +2956,88 @@ export class PostgresEngine implements BrainEngine {
       });
     }
     return result;
+  }
+
+  async relationalFanout(
+    seeds: string[],
+    opts?: import('./types.ts').RelationalFanoutOpts,
+  ): Promise<import('./types.ts').RelationalFanoutRow[]> {
+    if (!seeds || seeds.length === 0) return [];
+    const sql = this.sql;
+    const depth = Math.min(Math.max(1, opts?.depth ?? 2), 3);
+    const direction = opts?.direction ?? 'both';
+    const limit = Math.min(Math.max(1, opts?.limit ?? 50), 200);
+    const types = opts?.linkTypes && opts.linkTypes.length > 0 ? opts.linkTypes : null;
+
+    // Scope is applied to SEED selection only. Within-source traversal is
+    // enforced separately by `p2.source_id = w.seed_source` in the recursive
+    // step, so a walk can never cross a source boundary even when several
+    // sources are in scope.
+    const useSourceIds = opts?.sourceIds && opts.sourceIds.length > 0;
+    const seedScope = useSourceIds
+      ? sql`AND p.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND p.source_id = ${opts.sourceId}`
+        : sql``;
+    const typeFilter = types ? sql`AND l.link_type = ANY(${types}::text[])` : sql``;
+    const mentionsFilter = opts?.includeMentions
+      ? sql``
+      : sql`AND l.link_source IS DISTINCT FROM 'mentions'`;
+
+    // Recursive step join differs by direction; everything else is shared.
+    const recurStep =
+      direction === 'out'
+        ? sql`JOIN links l ON l.from_page_id = w.id JOIN pages p2 ON p2.id = l.to_page_id`
+        : direction === 'in'
+          ? sql`JOIN links l ON l.to_page_id = w.id JOIN pages p2 ON p2.id = l.from_page_id`
+          : sql`JOIN links l ON (l.from_page_id = w.id OR l.to_page_id = w.id)
+                JOIN pages p2 ON p2.id = CASE WHEN l.from_page_id = w.id THEN l.to_page_id ELSE l.from_page_id END`;
+
+    const rows = await sql`
+      WITH RECURSIVE walk AS (
+        SELECT p.id, p.slug, p.source_id, 0::int AS depth,
+               ARRAY[p.id] AS visited, ARRAY[p.slug] AS path,
+               p.source_id AS seed_source, NULL::text AS last_link_type
+        FROM pages p
+        WHERE p.slug = ANY(${seeds}::text[]) ${seedScope} AND p.deleted_at IS NULL
+        UNION ALL
+        SELECT p2.id, p2.slug, p2.source_id, w.depth + 1,
+               w.visited || p2.id, w.path || p2.slug,
+               w.seed_source, l.link_type
+        FROM walk w
+        ${recurStep}
+        WHERE w.depth < ${depth}
+          AND NOT (p2.id = ANY(w.visited))
+          AND p2.source_id = w.seed_source
+          AND p2.deleted_at IS NULL
+          ${mentionsFilter}
+          ${typeFilter}
+      )
+      SELECT n.source_id, n.slug,
+             MIN(n.depth) AS hop,
+             COUNT(DISTINCT n.last_link_type) AS edge_count,
+             array_agg(DISTINCT n.last_link_type)
+               FILTER (WHERE n.last_link_type IS NOT NULL) AS via_link_types,
+             (array_agg(array_to_string(n.path, chr(9))
+               ORDER BY n.depth ASC, array_length(n.path, 1) ASC))[1] AS path_str,
+             (SELECT cc.id FROM content_chunks cc
+               WHERE cc.page_id = n.id ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
+      FROM walk n
+      WHERE n.depth > 0
+      GROUP BY n.source_id, n.slug, n.id
+      ORDER BY hop ASC, edge_count DESC, n.source_id ASC, n.slug ASC
+      LIMIT ${limit}
+    `;
+
+    return (rows as Record<string, unknown>[]).map(r => ({
+      source_id: r.source_id as string,
+      slug: r.slug as string,
+      hop: Number(r.hop),
+      edge_count: Number(r.edge_count),
+      via_link_types: Array.isArray(r.via_link_types) ? (r.via_link_types as string[]) : [],
+      path: r.path_str ? String(r.path_str).split('\t') : [],
+      canonical_chunk_id: r.canonical_chunk_id == null ? null : Number(r.canonical_chunk_id),
+    }));
   }
 
   async getBacklinkCounts(slugs: string[]): Promise<Map<string, number>> {
@@ -3202,22 +3309,24 @@ export class PostgresEngine implements BrainEngine {
   }
 
   private async _addTimelineEntriesBatchOnce(entries: TimelineBatchInput[]): Promise<number> {
-    const sql = this.sql;
-    const slugs = entries.map(e => e.slug);
-    const dates = entries.map(e => e.date);
-    const sources = entries.map(e => e.source || '');
-    const summaries = entries.map(e => e.summary);
-    const details = entries.map(e => e.detail || '');
-    const sourceIds = entries.map(e => e.source_id || 'default');
-    const result = await sql`
-      INSERT INTO timeline_entries (page_id, date, source, summary, detail)
-      SELECT p.id, v.date::date, v.source, v.summary, v.detail
-      FROM unnest(${slugs}::text[], ${dates}::text[], ${sources}::text[], ${summaries}::text[], ${details}::text[], ${sourceIds}::text[])
-        AS v(slug, date, source, summary, detail, source_id)
-      JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id
-      ON CONFLICT (page_id, date, summary, source) DO NOTHING
-      RETURNING 1
-    `;
+    // #1861: JSONB jsonb_to_recordset instead of unnest(${arr}::text[]). Meeting
+    // summary/detail/source are free text with the same array-literal crash
+    // hazard as link context. See _addLinksBatchOnce for the full rationale.
+    // `date` stays text in the recordset and is cast v.date::date in the SELECT,
+    // exactly as the old unnest shape did.
+    const rows = buildTimelineRows(entries);
+    const result = await executeRawJsonb(
+      this,
+      `INSERT INTO timeline_entries (page_id, date, source, summary, detail)
+       SELECT p.id, v.date::date, v.source, v.summary, v.detail
+       FROM jsonb_to_recordset(($1::jsonb)->'rows')
+         AS v(slug text, date text, source text, summary text, detail text, source_id text)
+       JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id
+       ON CONFLICT (page_id, date, summary, source) DO NOTHING
+       RETURNING 1`,
+      [],
+      [{ rows }],
+    );
     return result.length;
   }
 
@@ -3883,53 +3992,51 @@ export class PostgresEngine implements BrainEngine {
   // v0.28: Takes (typed/weighted/attributed claims) + synthesis_evidence
   // ============================================================
 
-  async addTakesBatch(rowsIn: TakeBatchInput[]): Promise<number> {
+  async addTakesBatch(rowsIn: TakeBatchInput[], opts?: BatchOpts): Promise<number> {
     if (rowsIn.length === 0) return 0;
-    const sql = this.sql;
-    let weightClamped = 0;
-    const pageIds   = rowsIn.map(r => r.page_id);
-    const rowNums   = rowsIn.map(r => r.row_num);
-    const claims    = rowsIn.map(r => r.claim);
-    const kinds     = rowsIn.map(r => r.kind);
-    const holders   = rowsIn.map(r => r.holder);
-    const weights   = rowsIn.map(r => {
-      const { weight, clamped } = normalizeWeightForStorage(r.weight);
-      if (clamped) weightClamped++;
-      return weight;
-    });
-    const sinces    = rowsIn.map(r => r.since_date ?? null);
-    const untils    = rowsIn.map(r => r.until_date ?? null);
-    const sources   = rowsIn.map(r => r.source ?? null);
-    const supersededBys = rowsIn.map(r => r.superseded_by ?? null);
-    // postgres-js needs boolean arrays passed as text[] then SQL-cast to boolean[],
-    // otherwise the driver mis-detects element type. Same pattern as how the
-    // existing batch methods handle bools.
-    const actives   = rowsIn.map(r => (r.active ?? true) ? 'true' : 'false');
+    // v0.42.26: takes is a batch primitive too — wrap in batchRetry so a
+    // Supavisor circuit-breaker blip doesn't silently drop takes the way it
+    // could before (links/timeline already had this; takes was the gap).
+    return this.batchRetry(opts?.auditSite ?? 'addTakesBatch', opts?.signal, () => this._addTakesBatchOnce(rowsIn), rowsIn.length);
+  }
+
+  private async _addTakesBatchOnce(rowsIn: TakeBatchInput[]): Promise<number> {
+    // #1861: JSONB jsonb_to_recordset instead of unnest(${arr}::text[]). `claim`
+    // is free LLM-extracted prose with the same array-literal crash hazard as
+    // link context. JSONB additionally lets us declare NATIVE recordset column
+    // types and emit JSON-native numbers/booleans, which retires the old
+    // postgres-js ${actives}::text[]::boolean[] element-type workaround entirely.
+    // Weight clamp/round + NUL-stripping live in buildTakeRows (shared w/ PGLite).
+    // NOTE: ON CONFLICT here is DO UPDATE (not DO NOTHING) — an intra-batch
+    // duplicate (page_id, row_num) errors, identical to the pre-#1861 unnest path.
+    const { rows, weightClamped } = buildTakeRows(rowsIn);
     if (weightClamped > 0) {
       process.stderr.write(`[takes] TAKES_WEIGHT_CLAMPED: ${weightClamped} row(s) had weight outside [0,1]; clamped\n`);
     }
-    const result = await sql`
-      INSERT INTO takes (page_id, row_num, claim, kind, holder, weight, since_date, until_date, source, superseded_by, active)
-      SELECT v.page_id::int, v.row_num::int, v.claim, v.kind, v.holder, v.weight::real,
-             v.since_date::text, v.until_date::text, v.source, v.superseded_by::int, v.active::boolean
-      FROM unnest(
-        ${pageIds}::int[], ${rowNums}::int[], ${claims}::text[], ${kinds}::text[],
-        ${holders}::text[], ${weights}::real[], ${sinces}::text[], ${untils}::text[],
-        ${sources}::text[], ${supersededBys}::int[], ${actives}::text[]::boolean[]
-      ) AS v(page_id, row_num, claim, kind, holder, weight, since_date, until_date, source, superseded_by, active)
-      ON CONFLICT (page_id, row_num) DO UPDATE SET
-        claim         = EXCLUDED.claim,
-        kind          = EXCLUDED.kind,
-        holder        = EXCLUDED.holder,
-        weight        = EXCLUDED.weight,
-        since_date    = EXCLUDED.since_date,
-        until_date    = EXCLUDED.until_date,
-        source        = EXCLUDED.source,
-        superseded_by = EXCLUDED.superseded_by,
-        active        = EXCLUDED.active,
-        updated_at    = now()
-      RETURNING 1
-    `;
+    const result = await executeRawJsonb(
+      this,
+      `INSERT INTO takes (page_id, row_num, claim, kind, holder, weight, since_date, until_date, source, superseded_by, active)
+       SELECT v.page_id, v.row_num, v.claim, v.kind, v.holder, v.weight,
+              v.since_date, v.until_date, v.source, v.superseded_by, v.active
+       FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(
+         page_id int, row_num int, claim text, kind text, holder text, weight real,
+         since_date text, until_date text, source text, superseded_by int, active boolean
+       )
+       ON CONFLICT (page_id, row_num) DO UPDATE SET
+         claim         = EXCLUDED.claim,
+         kind          = EXCLUDED.kind,
+         holder        = EXCLUDED.holder,
+         weight        = EXCLUDED.weight,
+         since_date    = EXCLUDED.since_date,
+         until_date    = EXCLUDED.until_date,
+         source        = EXCLUDED.source,
+         superseded_by = EXCLUDED.superseded_by,
+         active        = EXCLUDED.active,
+         updated_at    = now()
+       RETURNING 1`,
+      [],
+      [{ rows }],
+    );
     return result.length;
   }
 
@@ -4748,9 +4855,26 @@ export class PostgresEngine implements BrainEngine {
 
   // Config
   async getConfig(key: string): Promise<string | null> {
-    const sql = this.sql;
-    const rows = await sql`SELECT value FROM config WHERE key = ${key}`;
-    return rows.length > 0 ? (rows[0].value as string) : null;
+    // #1603: a transient pooler drop on this read used to throw / fall through
+    // to defaults silently — which on remote Postgres surfaces as the wrong
+    // search mode/knobs and empty-stdout queries. Retry-with-reconnect using the
+    // same tuned opts as the bulk writers. No auditSite: this is a single-row
+    // read, not a bulk write, so it must not emit batch-retry audit rows.
+    // `this.sql` is a getter, so each attempt sees the pool rebuilt by reconnect.
+    const opts = this.getBulkRetryOpts();
+    return withRetry(
+      async () => {
+        const rows = await this.sql`SELECT value FROM config WHERE key = ${key}`;
+        return rows.length > 0 ? (rows[0].value as string) : null;
+      },
+      {
+        maxRetries: opts.maxRetries,
+        delayMs: opts.delayMs,
+        delayMaxMs: opts.delayMaxMs,
+        jitter: BULK_RETRY_OPTS.jitter,
+        reconnect: (ctx) => this.reconnect(ctx),
+      },
+    );
   }
 
   async setConfig(key: string, value: string): Promise<void> {
