@@ -9,6 +9,12 @@ export interface McpToolDef {
     required: string[];
   };
   /**
+   * Broad result schema. Individual operation payloads are JSON-stringified in
+   * MCP `content` today; this schema gives ChatGPT a declared output contract
+   * without falsely narrowing heterogeneous operation results.
+   */
+  outputSchema: Record<string, unknown>;
+  /**
    * MCP / ChatGPT tool-planning hints. These are advisory only: authorization
    * and mutation policy are still enforced server-side in operation dispatch.
    */
@@ -103,6 +109,7 @@ export function buildToolDefs(ops: Operation[]): McpToolDef[] {
           .filter(([, v]) => v.required)
           .map(([k]) => k),
       },
+      outputSchema: {},
       annotations: toolAnnotations(op),
       securitySchemes,
       _meta: {

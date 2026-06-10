@@ -69,6 +69,7 @@ function referenceToolDefs(ops: typeof operations) {
           .filter(([, v]) => v.required)
           .map(([k]) => k),
       },
+      outputSchema: {},
       annotations: {
         readOnlyHint: readOnly,
         destructiveHint: destructiveOperationNames.has(op.name),
@@ -120,6 +121,7 @@ describe('buildToolDefs', () => {
       expect(typeof def.annotations.readOnlyHint).toBe('boolean');
       expect(typeof def.annotations.destructiveHint).toBe('boolean');
       expect(typeof def.annotations.openWorldHint).toBe('boolean');
+      expect(def.outputSchema).toEqual({});
       expect(Array.isArray(def.securitySchemes)).toBe(true);
       expect(def.securitySchemes.length).toBe(1);
       expect(def._meta.securitySchemes).toEqual(def.securitySchemes);
