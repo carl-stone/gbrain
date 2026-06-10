@@ -8,6 +8,23 @@ export interface McpToolDef {
     properties: Record<string, unknown>;
     required: string[];
   };
+  /**
+   * MCP / ChatGPT tool-planning hints. These are advisory only: authorization
+   * and mutation policy are still enforced server-side in operation dispatch.
+   */
+  annotations: {
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    openWorldHint: boolean;
+    idempotentHint?: boolean;
+  };
+  /** OAuth scope required for this tool, mirrored in _meta for older clients. */
+  securitySchemes: Array<{ type: 'oauth2'; scopes: string[] }>;
+  _meta: {
+    securitySchemes: Array<{ type: 'oauth2'; scopes: string[] }>;
+    'openai/toolInvocation/invoking': string;
+    'openai/toolInvocation/invoked': string;
+  };
 }
 
 /**
@@ -37,18 +54,62 @@ export function paramDefToSchema(p: ParamDef): Record<string, unknown> {
   };
 }
 
+const DESTRUCTIVE_OPERATION_NAMES = new Set([
+  'delete_page',
+  'purge_deleted_pages',
+  'remove_link',
+  'remove_tag',
+  'forget_fact',
+  'revert_version',
+  'restore_page',
+  'schema_apply_mutations',
+]);
+
+function requiredScope(op: Operation): string {
+  return op.scope ?? 'read';
+}
+
+function toolAnnotations(op: Operation): McpToolDef['annotations'] {
+  const readOnly = op.mutating !== true;
+  return {
+    readOnlyHint: readOnly,
+    destructiveHint: DESTRUCTIVE_OPERATION_NAMES.has(op.name),
+    // GBrain tools operate inside the authenticated user's brain/account. Even
+    // mutating tools are not open-world publication unless a future operation
+    // explicitly declares that behavior.
+    openWorldHint: false,
+    ...(readOnly ? { idempotentHint: true } : {}),
+  };
+}
+
+function invocationText(op: Operation, phase: 'invoking' | 'invoked'): string {
+  const verb = phase === 'invoking' ? 'Running' : 'Done';
+  const text = `${verb} ${op.name}`;
+  return text.length <= 64 ? text : text.slice(0, 64);
+}
+
 export function buildToolDefs(ops: Operation[]): McpToolDef[] {
-  return ops.map(op => ({
-    name: op.name,
-    description: op.description,
-    inputSchema: {
-      type: 'object' as const,
-      properties: Object.fromEntries(
-        Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
-      ),
-      required: Object.entries(op.params)
-        .filter(([, v]) => v.required)
-        .map(([k]) => k),
-    },
-  }));
+  return ops.map(op => {
+    const securitySchemes = [{ type: 'oauth2' as const, scopes: [requiredScope(op)] }];
+    return {
+      name: op.name,
+      description: op.description,
+      inputSchema: {
+        type: 'object' as const,
+        properties: Object.fromEntries(
+          Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
+        ),
+        required: Object.entries(op.params)
+          .filter(([, v]) => v.required)
+          .map(([k]) => k),
+      },
+      annotations: toolAnnotations(op),
+      securitySchemes,
+      _meta: {
+        securitySchemes,
+        'openai/toolInvocation/invoking': invocationText(op, 'invoking'),
+        'openai/toolInvocation/invoked': invocationText(op, 'invoked'),
+      },
+    };
+  });
 }

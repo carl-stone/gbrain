@@ -3,9 +3,8 @@
  *
  * Before v0.15 the mapping lived inline in src/mcp/server.ts. After the
  * extraction, buildToolDefs is the single source of truth; the subagent tool
- * registry calls it with a filtered OPERATIONS subset. This test pins the
- * extracted output to the pre-extraction shape byte-for-byte so we don't
- * silently drift the MCP-facing tool schema.
+ * registry calls it with a filtered OPERATIONS subset. These tests pin the
+ * MCP-facing tool schema, including ChatGPT/MCP metadata annotations.
  */
 
 import { describe, test, expect } from 'bun:test';
@@ -43,26 +42,53 @@ function referenceParamDefToSchema(p: ParamDefLike): Record<string, unknown> {
     ...(p.items ? { items: referenceParamDefToSchema(p.items) } : {}),
   };
 }
-function legacyInlineMap(ops: typeof operations) {
-  return ops.map(op => ({
-    name: op.name,
-    description: op.description,
-    inputSchema: {
-      type: 'object' as const,
-      properties: Object.fromEntries(
-        Object.entries(op.params).map(([k, v]) => [k, referenceParamDefToSchema(v)]),
-      ),
-      required: Object.entries(op.params)
-        .filter(([, v]) => v.required)
-        .map(([k]) => k),
-    },
-  }));
+const destructiveOperationNames = new Set([
+  'delete_page',
+  'purge_deleted_pages',
+  'remove_link',
+  'remove_tag',
+  'forget_fact',
+  'revert_version',
+  'restore_page',
+  'schema_apply_mutations',
+]);
+
+function referenceToolDefs(ops: typeof operations) {
+  return ops.map(op => {
+    const readOnly = op.mutating !== true;
+    const securitySchemes = [{ type: 'oauth2' as const, scopes: [op.scope ?? 'read'] }];
+    return {
+      name: op.name,
+      description: op.description,
+      inputSchema: {
+        type: 'object' as const,
+        properties: Object.fromEntries(
+          Object.entries(op.params).map(([k, v]) => [k, referenceParamDefToSchema(v)]),
+        ),
+        required: Object.entries(op.params)
+          .filter(([, v]) => v.required)
+          .map(([k]) => k),
+      },
+      annotations: {
+        readOnlyHint: readOnly,
+        destructiveHint: destructiveOperationNames.has(op.name),
+        openWorldHint: false,
+        ...(readOnly ? { idempotentHint: true } : {}),
+      },
+      securitySchemes,
+      _meta: {
+        securitySchemes,
+        'openai/toolInvocation/invoking': `Running ${op.name}`.slice(0, 64),
+        'openai/toolInvocation/invoked': `Done ${op.name}`.slice(0, 64),
+      },
+    };
+  });
 }
 
 describe('buildToolDefs', () => {
-  test('output equals pre-extraction inline mapping byte-for-byte', () => {
+  test('output equals the pinned MCP tool descriptor mapping byte-for-byte', () => {
     const extracted = buildToolDefs(operations);
-    const inline = legacyInlineMap(operations);
+    const inline = referenceToolDefs(operations);
     expect(JSON.stringify(extracted)).toBe(JSON.stringify(inline));
   });
 
@@ -86,6 +112,33 @@ describe('buildToolDefs', () => {
       expect(def.inputSchema.type).toBe('object');
       expect(typeof def.inputSchema.properties).toBe('object');
       expect(Array.isArray(def.inputSchema.required)).toBe(true);
+    }
+  });
+
+  test('every def has ChatGPT/MCP annotations and mirrored OAuth metadata', () => {
+    for (const def of buildToolDefs(operations)) {
+      expect(typeof def.annotations.readOnlyHint).toBe('boolean');
+      expect(typeof def.annotations.destructiveHint).toBe('boolean');
+      expect(typeof def.annotations.openWorldHint).toBe('boolean');
+      expect(Array.isArray(def.securitySchemes)).toBe(true);
+      expect(def.securitySchemes.length).toBe(1);
+      expect(def._meta.securitySchemes).toEqual(def.securitySchemes);
+      expect(def._meta['openai/toolInvocation/invoking'].length).toBeLessThanOrEqual(64);
+      expect(def._meta['openai/toolInvocation/invoked'].length).toBeLessThanOrEqual(64);
+    }
+  });
+
+  test('list_skills and get_skill are explicitly read-only and non-open-world', () => {
+    for (const name of ['list_skills', 'get_skill']) {
+      const def = buildToolDefs(operations).find(d => d.name === name);
+      expect(def).toBeTruthy();
+      expect(def!.annotations).toEqual({
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+        idempotentHint: true,
+      });
+      expect(def!.securitySchemes[0].scopes).toEqual(['read']);
     }
   });
 });
