@@ -53,6 +53,11 @@ const destructiveOperationNames = new Set([
   'schema_apply_mutations',
 ]);
 
+const defaultOutputSchema = {
+  type: 'object',
+  additionalProperties: true,
+} as const;
+
 function referenceToolDefs(ops: typeof operations) {
   return ops.map(op => {
     const readOnly = op.mutating !== true;
@@ -69,7 +74,7 @@ function referenceToolDefs(ops: typeof operations) {
           .filter(([, v]) => v.required)
           .map(([k]) => k),
       },
-      outputSchema: {},
+      outputSchema: op.outputSchema ?? defaultOutputSchema,
       annotations: {
         readOnlyHint: readOnly,
         destructiveHint: destructiveOperationNames.has(op.name),
@@ -121,7 +126,8 @@ describe('buildToolDefs', () => {
       expect(typeof def.annotations.readOnlyHint).toBe('boolean');
       expect(typeof def.annotations.destructiveHint).toBe('boolean');
       expect(typeof def.annotations.openWorldHint).toBe('boolean');
-      expect(def.outputSchema).toEqual({});
+      expect(def.outputSchema).toBeTruthy();
+      expect(typeof def.outputSchema).toBe('object');
       expect(Array.isArray(def.securitySchemes)).toBe(true);
       expect(def.securitySchemes.length).toBe(1);
       expect(def._meta.securitySchemes).toEqual(def.securitySchemes);
@@ -142,6 +148,15 @@ describe('buildToolDefs', () => {
       });
       expect(def!.securitySchemes[0].scopes).toEqual(['read']);
     }
+  });
+
+  test('skill tools carry precise output object schemas', () => {
+    const list = buildToolDefs(operations).find(d => d.name === 'list_skills');
+    const get = buildToolDefs(operations).find(d => d.name === 'get_skill');
+    expect(list!.outputSchema).toHaveProperty('properties.skills.items.properties.usable_tools');
+    expect(list!.outputSchema).toHaveProperty('properties.instructions.properties.fetch_op');
+    expect(get!.outputSchema).toHaveProperty('properties.body.type', 'string');
+    expect(get!.outputSchema).toHaveProperty('properties.client_guidance.properties.protocol.items.type', 'string');
   });
 });
 

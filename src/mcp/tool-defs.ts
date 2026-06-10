@@ -60,6 +60,11 @@ export function paramDefToSchema(p: ParamDef): Record<string, unknown> {
   };
 }
 
+const DEFAULT_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: true,
+} as const;
+
 const DESTRUCTIVE_OPERATION_NAMES = new Set([
   'delete_page',
   'purge_deleted_pages',
@@ -109,7 +114,7 @@ export function buildToolDefs(ops: Operation[]): McpToolDef[] {
           .filter(([, v]) => v.required)
           .map(([k]) => k),
       },
-      outputSchema: {},
+      outputSchema: op.outputSchema ?? DEFAULT_OUTPUT_SCHEMA,
       annotations: toolAnnotations(op),
       securitySchemes,
       _meta: {

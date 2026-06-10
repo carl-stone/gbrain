@@ -567,6 +567,8 @@ export interface Operation {
   name: string;
   description: string;
   params: Record<string, ParamDef>;
+  /** Optional JSON Schema for the successful operation result when surfaced as MCP structuredContent. */
+  outputSchema?: Record<string, unknown>;
   handler: (ctx: OperationContext, params: Record<string, unknown>) => Promise<unknown>;
   mutating?: boolean;
   /**
@@ -2193,9 +2195,86 @@ const get_brain_identity: Operation = {
 // these over HTTP. The host-filesystem read is gated by mcp.publish_skills +
 // path confinement — see the trust-boundary memo in skill-catalog.ts.
 
+const skillCatalogEntrySchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    name: { type: 'string' },
+    description: { type: 'string' },
+    section: { type: 'string' },
+    triggers: { type: 'array', items: { type: 'string' } },
+    tools: { type: 'array', items: { type: 'string' } },
+    usable_tools: { type: 'array', items: { type: 'string' } },
+    unavailable_tools: { type: 'array', items: { type: 'string' } },
+    writes_pages: { type: 'boolean' },
+    mutating: { type: 'boolean' },
+  },
+  required: ['name', 'description', 'section', 'triggers', 'tools', 'usable_tools', 'unavailable_tools', 'writes_pages', 'mutating'],
+} as const;
+
+const listSkillsOutputSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    schema_version: { type: 'number' },
+    skills_dir_source: { type: 'string' },
+    count: { type: 'number' },
+    skills: { type: 'array', items: skillCatalogEntrySchema },
+    instructions: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        summary: { type: 'string' },
+        how_to_use: { type: 'array', items: { type: 'string' } },
+        available_brain_tools: { type: 'array', items: { type: 'string' } },
+        fetch_op: { type: 'string', enum: ['get_skill'] },
+      },
+      required: ['summary', 'how_to_use', 'available_brain_tools', 'fetch_op'],
+    },
+  },
+  required: ['schema_version', 'skills_dir_source', 'count', 'skills', 'instructions'],
+} as const;
+
+const getSkillOutputSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    schema_version: { type: 'number' },
+    name: { type: 'string' },
+    frontmatter: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string' },
+        description: { type: 'string' },
+        triggers: { type: 'array', items: { type: 'string' } },
+        tools: { type: 'array', items: { type: 'string' } },
+        writes_pages: { type: 'boolean' },
+        mutating: { type: 'boolean' },
+      },
+    },
+    body: { type: 'string' },
+    usable_tools: { type: 'array', items: { type: 'string' } },
+    unavailable_tools: { type: 'array', items: { type: 'string' } },
+    client_guidance: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        nature: { type: 'string' },
+        protocol: { type: 'array', items: { type: 'string' } },
+        available_brain_tools: { type: 'array', items: { type: 'string' } },
+        mutating: { type: 'boolean' },
+      },
+      required: ['nature', 'protocol', 'available_brain_tools', 'mutating'],
+    },
+  },
+  required: ['schema_version', 'name', 'frontmatter', 'body', 'usable_tools', 'unavailable_tools', 'client_guidance'],
+} as const;
+
 const list_skills: Operation = {
   name: 'list_skills',
   description: LIST_SKILLS_DESCRIPTION,
+  outputSchema: listSkillsOutputSchema as Record<string, unknown>,
   params: {
     section: {
       type: 'string',
@@ -2218,6 +2297,7 @@ const list_skills: Operation = {
 const get_skill: Operation = {
   name: 'get_skill',
   description: GET_SKILL_DESCRIPTION,
+  outputSchema: getSkillOutputSchema as Record<string, unknown>,
   params: {
     name: {
       type: 'string',

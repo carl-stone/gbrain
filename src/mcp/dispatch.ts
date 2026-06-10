@@ -13,6 +13,7 @@ import { loadConfig } from '../core/config.ts';
 
 export interface ToolResult {
   content: { type: 'text'; text: string }[];
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
   /**
    * v0.31 (eD3): MCP spec-blessed metadata slot for server-supplied data.
@@ -251,7 +252,14 @@ export async function dispatchToolCall(
 
   try {
     const result = await op.handler(ctx, safeParams);
-    const out: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    const structuredContent =
+      result && typeof result === 'object' && !Array.isArray(result)
+        ? result as Record<string, unknown>
+        : { result };
+    const out: ToolResult = {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      structuredContent,
+    };
     // v0.31 (eD3 + eE4): best-effort _meta.brain_hot_memory injection.
     // The hook is wrapped in its own try/catch — any DB blip / cache miss /
     // helper crash degrades to no `_meta` rather than flipping the whole
