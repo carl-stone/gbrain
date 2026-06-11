@@ -36,6 +36,7 @@ import { join, dirname, isAbsolute, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
+import { MinionWorker } from '../minions/worker.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
 import { discoverTranscripts, type DiscoveredTranscript } from './transcript-discovery.ts';
@@ -462,7 +463,14 @@ export async function runPhaseSynthesize(
         const childData: SubagentHandlerData = {
           prompt: buildSynthesisPrompt(t, chunks[i], i, chunks.length, priorContradictionsBlock),
           model: subagentModel,
-          max_turns: 30,
+          // Gateway/OpenAI-compatible providers can reject the follow-up turn
+          // after parallel tool calls if the provider's tool-result envelope is
+          // stricter than Anthropic's. Synthesis only needs the subagent to
+          // write pages via tools; the orchestrator collects tool executions,
+          // not final prose. One assistant turn preserves that contract and
+          // avoids provider-specific replay/tool-result churn under PGLite.
+          max_turns: subagentModel.startsWith('anthropic:') ? 30 : 1,
+          allowed_tools: subagentModel.startsWith('anthropic:') ? undefined : ['put_page'],
           allowed_slug_prefixes: allowedSlugPrefixes,
         };
         // Idempotency key parity:
@@ -496,6 +504,19 @@ export async function runPhaseSynthesize(
     // Wait for every child to reach a terminal state. Tick yieldDuringPhase
     // every 5 min so the cycle lock TTL refreshes.
     const childOutcomes: Array<{ jobId: number; status: string }> = [];
+    let inlineWorker: MinionWorker | null = null;
+    let inlineWorkerPromise: Promise<void> | null = null;
+    if (engine.kind === 'pglite' && childIds.length > 0) {
+      inlineWorker = new MinionWorker(engine, {
+        queue: 'default',
+        concurrency: 1,
+        pollInterval: 100,
+        healthCheckInterval: 0,
+      });
+      const { registerBuiltinHandlers } = await import('../../commands/jobs.ts');
+      await registerBuiltinHandlers(inlineWorker, engine, { quiet: true });
+      inlineWorkerPromise = inlineWorker.start();
+    }
     for (const jobId of childIds) {
       try {
         const job = await waitForCompletion(queue, jobId, {
@@ -514,6 +535,10 @@ export async function runPhaseSynthesize(
       if (opts.yieldDuringPhase) {
         try { await opts.yieldDuringPhase(); } catch { /* best-effort */ }
       }
+    }
+    if (inlineWorker) {
+      inlineWorker.stop();
+      await inlineWorkerPromise;
     }
 
     // Collect slugs from put_page tool executions across the children
