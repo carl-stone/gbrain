@@ -139,3 +139,51 @@ describe('get_skill over dispatch', () => {
     });
   });
 });
+
+describe('source-aware skill catalog over dispatch', () => {
+  test('remote client lists and fetches skills from federated readable source catalogs', async () => {
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await engine.setConfig('mcp.publish_skills', 'true');
+      const sourceRoot = mkdtempSync(join(tmpdir(), 'coding-skills-source-'));
+      try {
+        const skillDir = join(sourceRoot, 'skills', 'soul-audit');
+        await Bun.write(join(skillDir, 'SKILL.md'), `---\nname: soul-audit\ndescription: Source-specific identity audit\ntools:\n  - search\n---\n\n# Soul Audit\n\nSource-specific identity audit instructions.\n`);
+        await engine.executeRaw(
+          `INSERT INTO sources (id, name, local_path, config) VALUES ($1, $2, $3, $4)`,
+          ['coding-agents', 'Coding agents', sourceRoot, JSON.stringify({ federated: true })],
+        );
+        const auth: AuthInfo = {
+          token: 't',
+          clientId: 'c',
+          scopes: ['read'],
+          sourceId: 'default',
+          allowedSources: ['default', 'coding-agents'],
+        };
+        const listed = await call('list_skills', {}, { remote: true, auth });
+        expect(listed.isError).toBe(false);
+        const soul = listed.body.skills.find((s: any) => s.name === 'soul-audit');
+        expect(soul).toBeTruthy();
+        expect(soul.source_id).toBe('coding-agents');
+
+        const detail = await call('get_skill', { name: 'soul-audit' }, { remote: true, auth });
+        expect(detail.isError).toBe(false);
+        expect(detail.body.source_id).toBe('coding-agents');
+        expect(detail.body.body).toContain('Source-specific identity audit');
+      } finally {
+        rmSync(sourceRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test('remote client cannot request a source outside federated_read', async () => {
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await engine.setConfig('mcp.publish_skills', 'true');
+      const r = await call('list_skills', { source_id: 'coding-agents' }, {
+        remote: true,
+        auth: { token: 't', clientId: 'c', scopes: ['read'], sourceId: 'default', allowedSources: ['default'] },
+      });
+      expect(r.isError).toBe(true);
+      expect(r.body.error).toBe('insufficient_scope');
+    });
+  });
+});

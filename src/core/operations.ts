@@ -2200,6 +2200,7 @@ const skillCatalogEntrySchema = {
   additionalProperties: false,
   properties: {
     name: { type: 'string' },
+    source_id: { type: 'string' },
     description: { type: 'string' },
     section: { type: 'string' },
     triggers: { type: 'array', items: { type: 'string' } },
@@ -2209,7 +2210,7 @@ const skillCatalogEntrySchema = {
     writes_pages: { type: 'boolean' },
     mutating: { type: 'boolean' },
   },
-  required: ['name', 'description', 'section', 'triggers', 'tools', 'usable_tools', 'unavailable_tools', 'writes_pages', 'mutating'],
+  required: ['name', 'source_id', 'description', 'section', 'triggers', 'tools', 'usable_tools', 'unavailable_tools', 'writes_pages', 'mutating'],
 } as const;
 
 const listSkillsOutputSchema = {
@@ -2241,6 +2242,7 @@ const getSkillOutputSchema = {
   properties: {
     schema_version: { type: 'number' },
     name: { type: 'string' },
+    source_id: { type: 'string' },
     frontmatter: {
       type: 'object',
       additionalProperties: false,
@@ -2268,7 +2270,7 @@ const getSkillOutputSchema = {
       required: ['nature', 'protocol', 'available_brain_tools', 'mutating'],
     },
   },
-  required: ['schema_version', 'name', 'frontmatter', 'body', 'usable_tools', 'unavailable_tools', 'client_guidance'],
+  required: ['schema_version', 'name', 'source_id', 'frontmatter', 'body', 'usable_tools', 'unavailable_tools', 'client_guidance'],
 } as const;
 
 const list_skills: Operation = {
@@ -2280,15 +2282,18 @@ const list_skills: Operation = {
       type: 'string',
       description: 'Optional: only skills whose routing section matches this exactly.',
     },
+    source_id: {
+      type: 'string',
+      description: 'Optional: only list skills from this readable source. Omit to list all readable source catalogs.',
+    },
   },
   handler: async (ctx, p) => {
     const sc = await import('./skill-catalog.ts');
     const publish = await sc.readMcpPublishSkills(ctx);
     sc.assertPublishEnabled(ctx, publish);
-    const override = await sc.readMcpSkillsDir(ctx);
-    const { dir, source } = sc.resolveSkillsDir(ctx, override);
     const section = typeof p.section === 'string' ? p.section : undefined;
-    return sc.buildSkillCatalog(ctx, dir, source, { section });
+    const sourceId = typeof p.source_id === 'string' ? p.source_id : undefined;
+    return sc.buildReadableSkillCatalog(ctx, { section, sourceId });
   },
   scope: 'read',
   cliHints: { name: 'skills', positional: [] },
@@ -2304,15 +2309,18 @@ const get_skill: Operation = {
       required: true,
       description: 'Skill name exactly as returned by list_skills.',
     },
+    source_id: {
+      type: 'string',
+      description: 'Optional: fetch the skill from a specific readable source. Omit to search readable source catalogs in order.',
+    },
   },
   handler: async (ctx, p) => {
     const sc = await import('./skill-catalog.ts');
     const publish = await sc.readMcpPublishSkills(ctx);
     sc.assertPublishEnabled(ctx, publish);
-    const override = await sc.readMcpSkillsDir(ctx);
-    const { dir } = sc.resolveSkillsDir(ctx, override);
     const name = typeof p.name === 'string' ? p.name : '';
-    return sc.getSkillDetail(ctx, dir, name);
+    const sourceId = typeof p.source_id === 'string' ? p.source_id : undefined;
+    return sc.getReadableSkillDetail(ctx, name, { sourceId });
   },
   scope: 'read',
   cliHints: { name: 'skill', positional: ['name'] },

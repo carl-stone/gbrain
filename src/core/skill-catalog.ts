@@ -83,6 +83,8 @@ export type ResolvedSkillsDirSource = SkillsDirSource | 'config';
 
 export interface SkillCatalogEntry {
   name: string;
+  /** Source whose skills/<name>/SKILL.md produced this catalog row. */
+  source_id: string;
   description: string;
   section: string;
   triggers: string[];
@@ -111,6 +113,8 @@ export interface ListSkillsResult {
 export interface GetSkillResult {
   schema_version: 1;
   name: string;
+  /** Source whose skills/<name>/SKILL.md produced this detail. */
+  source_id: string;
   /** Allowlisted projection — never the raw frontmatter object. */
   frontmatter: {
     name?: string;
@@ -166,6 +170,70 @@ export async function readMcpSkillsDir(ctx: OperationContext): Promise<string | 
   if (dbVal && dbVal.trim().length > 0) return dbVal;
   const fileVal = ctx.config?.mcp?.skills_dir;
   return fileVal && fileVal.trim().length > 0 ? fileVal : undefined;
+}
+
+export interface ResolvedSourceSkillsDir {
+  source_id: string;
+  dir: string;
+  source: ResolvedSkillsDirSource;
+}
+
+function sourceReadableByCaller(ctx: OperationContext, sourceId: string): boolean {
+  if (ctx.remote === false) return true;
+  const allowed = ctx.auth?.allowedSources;
+  if (allowed && allowed.length > 0) return allowed.includes(sourceId);
+  return (ctx.auth?.sourceId ?? ctx.sourceId ?? 'default') === sourceId;
+}
+
+
+/** Resolve source-aware skill directories visible to this caller. */
+export async function resolveReadableSkillsDirs(
+  ctx: OperationContext,
+  opts: { sourceId?: string; includeAllReadable?: boolean } = {},
+): Promise<ResolvedSourceSkillsDir[]> {
+  const requested = opts.sourceId;
+  if (requested && !sourceReadableByCaller(ctx, requested)) {
+    throw new OperationError(
+      'insufficient_scope',
+      `Cannot read skills from source: ${requested}`,
+      'Reconnect with federated_read including that source, or omit source_id.',
+    );
+  }
+
+  const override = await readMcpSkillsDir(ctx);
+  const out: ResolvedSourceSkillsDir[] = [];
+
+  // Preserve the configured/default host catalog for the default source. This
+  // keeps existing deployments working while allowing source-specific catalogs
+  // under <source.local_path>/skills.
+  if (!requested || requested === 'default') {
+    const { dir, source } = resolveSkillsDir(ctx, override);
+    out.push({ source_id: 'default', dir, source });
+    if (requested === 'default') return out;
+  }
+
+  let sourceRows: Awaited<ReturnType<OperationContext['engine']['listAllSources']>>;
+  try {
+    sourceRows = await ctx.engine.listAllSources({ localPathOnly: true });
+  } catch {
+    return out;
+  }
+
+  const candidateIds = requested
+    ? [requested]
+    : opts.includeAllReadable
+      ? sourceRows.map(s => s.id).filter(id => id !== 'default' && sourceReadableByCaller(ctx, id))
+      : [];
+
+  for (const sid of candidateIds) {
+    const row = sourceRows.find(s => s.id === sid);
+    if (!row?.local_path) continue;
+    const dir = join(row.local_path, 'skills');
+    if (!existsSync(dir)) continue;
+    out.push({ source_id: sid, dir, source: 'config' });
+  }
+
+  return out;
 }
 
 /**
@@ -438,7 +506,7 @@ export function buildSkillCatalog(
   ctx: OperationContext,
   skillsDir: string,
   source: ResolvedSkillsDirSource,
-  opts: { section?: string } = {},
+  opts: { section?: string; sourceId?: string } = {},
 ): ListSkillsResult {
   const { skills: manifest } = loadOrDeriveManifest(skillsDir);
   const triggerMap = buildTriggerMap(skillsDir);
@@ -474,6 +542,7 @@ export function buildSkillCatalog(
     const { usable_tools, unavailable_tools } = crossReferenceTools(tools, ctx);
     skills.push({
       name: entry.name,
+      source_id: opts.sourceId ?? 'default',
       description: oneLineDescription(raw, body),
       section,
       triggers,
@@ -501,11 +570,45 @@ export function buildSkillCatalog(
   };
 }
 
+export async function buildReadableSkillCatalog(
+  ctx: OperationContext,
+  opts: { section?: string; sourceId?: string } = {},
+): Promise<ListSkillsResult> {
+  const dirs = await resolveReadableSkillsDirs(ctx, {
+    sourceId: opts.sourceId,
+    includeAllReadable: opts.sourceId === undefined,
+  });
+  const merged: SkillCatalogEntry[] = [];
+  for (const d of dirs) {
+    const catalog = buildSkillCatalog(ctx, d.dir, d.source, {
+      section: opts.section,
+      sourceId: d.source_id,
+    });
+    merged.push(...catalog.skills);
+  }
+  merged.sort((a, b) =>
+    a.name.localeCompare(b.name) || a.source_id.localeCompare(b.source_id),
+  );
+  return {
+    schema_version: 1,
+    skills_dir_source: 'config',
+    count: merged.length,
+    skills: merged,
+    instructions: {
+      summary: SKILL_CATALOG_INSTRUCTIONS.summary,
+      how_to_use: [...SKILL_CATALOG_INSTRUCTIONS.how_to_use],
+      available_brain_tools: availableBrainTools(ctx),
+      fetch_op: 'get_skill',
+    },
+  };
+}
+
 /** Fetch one skill's full instructions (prose only, size-capped, sanitized). */
 export function getSkillDetail(
   ctx: OperationContext,
   skillsDir: string,
   name: string,
+  sourceId = 'default',
 ): GetSkillResult {
   const path = resolveSkillMdPath(skillsDir, name);
 
@@ -532,6 +635,7 @@ export function getSkillDetail(
   return {
     schema_version: 1,
     name,
+    source_id: sourceId,
     frontmatter: {
       name: parsed?.name,
       description: oneLineDescription(raw, body) || undefined,
@@ -550,6 +654,36 @@ export function getSkillDetail(
       mutating,
     },
   };
+}
+
+export async function getReadableSkillDetail(
+  ctx: OperationContext,
+  name: string,
+  opts: { sourceId?: string } = {},
+): Promise<GetSkillResult> {
+  const dirs = await resolveReadableSkillsDirs(ctx, {
+    sourceId: opts.sourceId,
+    includeAllReadable: opts.sourceId === undefined,
+  });
+  const misses: string[] = [];
+  for (const d of dirs) {
+    try {
+      return getSkillDetail(ctx, d.dir, name, d.source_id);
+    } catch (e) {
+      if (e instanceof OperationError && e.code === 'page_not_found') {
+        misses.push(d.source_id);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new OperationError(
+    'page_not_found',
+    `Skill not found: ${name}`,
+    misses.length > 0
+      ? `Searched readable sources: ${misses.join(', ')}. Call list_skills to see available skills.`
+      : 'Call list_skills to see available skills.',
+  );
 }
 
 // ---------------------------------------------------------------------------
