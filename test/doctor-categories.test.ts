@@ -1,10 +1,10 @@
 /**
  * Drift guard for src/core/doctor-categories.ts.
  *
- * Reads src/commands/doctor.ts source via a literal-string scan, enumerates
- * every `name: '<...>'` Check name, and asserts each appears in exactly ONE
- * category set. The union of the four sets must equal the discovered names
- * exactly — no orphans, no extras.
+ * Reads src/commands/doctor.ts plus imported onboard check source via a
+ * literal-string scan, enumerates every `name: '<...>'` Check name, and
+ * asserts each appears in exactly ONE category set. The union of the four
+ * sets must equal the discovered names exactly — no orphans, no extras.
  *
  * This is the structural failure the v0.41.19.0 plan-eng-review caught:
  * doctor.ts grows new checks regularly; without this guard, the
@@ -24,21 +24,29 @@ import {
   _resetUnknownCheckWarningsForTest,
 } from '../src/core/doctor-categories.ts';
 
-const DOCTOR_TS_PATH = join(import.meta.dir, '..', 'src', 'commands', 'doctor.ts');
+const CHECK_SOURCE_PATHS = [
+  join(import.meta.dir, '..', 'src', 'commands', 'doctor.ts'),
+  // doctor.ts appends runAllOnboardChecks() results; their literal check
+  // names live here, not in doctor.ts, but categorizeCheck still sees them
+  // at runtime.
+  join(import.meta.dir, '..', 'src', 'core', 'onboard', 'checks.ts'),
+];
 
 function enumerateCheckNames(): Set<string> {
-  const source = readFileSync(DOCTOR_TS_PATH, 'utf-8');
   const names = new Set<string>();
-  // 1) Inline object-literal form: `{ name: 'foo', ... }`.
-  for (const m of source.matchAll(/name:\s*['"]([a-z][a-z0-9_]+)['"]/g)) {
-    names.add(m[1]);
-  }
-  // 2) Helper-function form: `const name = 'foo';` inside a check helper.
-  //    Catches checks like `nightly_quality_probe_health` and
-  //    `conversation_facts_backlog` that build the Check from a captured
-  //    name constant.
-  for (const m of source.matchAll(/const\s+name\s*=\s*['"]([a-z][a-z0-9_]+)['"]/g)) {
-    names.add(m[1]);
+  for (const sourcePath of CHECK_SOURCE_PATHS) {
+    const source = readFileSync(sourcePath, 'utf-8');
+    // 1) Inline object-literal form: `{ name: 'foo', ... }`.
+    for (const m of source.matchAll(/name:\s*['"]([a-z][a-z0-9_]+)['"]/g)) {
+      names.add(m[1]);
+    }
+    // 2) Helper-function form: `const name = 'foo';` inside a check helper.
+    //    Catches checks like `nightly_quality_probe_health` and
+    //    `conversation_facts_backlog` that build the Check from a captured
+    //    name constant.
+    for (const m of source.matchAll(/const\s+name\s*=\s*['"]([a-z][a-z0-9_]+)['"]/g)) {
+      names.add(m[1]);
+    }
   }
   return names;
 }
@@ -59,7 +67,7 @@ describe('doctor-categories drift guard', () => {
     }
     if (missing.length > 0) {
       throw new Error(
-        `These check names appear in doctor.ts but are not categorized in ` +
+        `These check names appear in doctor/onboard sources but are not categorized in ` +
           `src/core/doctor-categories.ts: ${missing.sort().join(', ')}. ` +
           `Add each to BRAIN/SKILL/OPS/META_CHECK_NAMES.`,
       );
@@ -106,7 +114,7 @@ describe('doctor-categories drift guard', () => {
     // refactors require more headroom.
     if (stale.length > 2) {
       throw new Error(
-        `These categorized names no longer appear in doctor.ts: ${stale.sort().join(', ')}. ` +
+        `These categorized names no longer appear in doctor/onboard sources: ${stale.sort().join(', ')}. ` +
           `Remove them from src/core/doctor-categories.ts.`,
       );
     }
