@@ -106,6 +106,19 @@ describe('loadOpCheckpoint / recordCompleted / clearOpCheckpoint', () => {
     expect(result.sort()).toEqual(['chunk-1', 'chunk-2', 'chunk-3']);
   });
 
+  test('stores empty completed keys as a JSONB array', async () => {
+    const key = { op: 'embed', fingerprint: 'empty-array' };
+    expect(await recordCompleted(engine, key, [])).toBe(true);
+    const rows = await engine.executeRaw<{ kind: string; value: unknown }>(
+      `SELECT jsonb_typeof(completed_keys) AS kind, completed_keys AS value
+         FROM op_checkpoints WHERE op = $1 AND fingerprint = $2`,
+      [key.op, key.fingerprint],
+    );
+    expect(rows[0]?.kind).toBe('array');
+    expect(rows[0]?.value).toEqual([]);
+    expect(await loadOpCheckpoint(engine, key)).toEqual([]);
+  });
+
   test('write overwrites prior state', async () => {
     const key = { op: 'embed', fingerprint: 'abc12345' };
     await recordCompleted(engine, key, ['chunk-1']);

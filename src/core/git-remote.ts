@@ -141,11 +141,12 @@ export class GitOperationError extends Error {
 }
 
 const GIT_ENV = {
-  // Confine to the gbrain SSRF model — no credential helpers, no SSH askpass,
-  // no GUI prompts. Inherit PATH so git itself is findable.
+  // Confine to the gbrain SSRF model — no interactive prompts or ambient
+  // credential helpers. A host may opt into one explicit noninteractive
+  // askpass program for authenticated HTTPS remotes.
   GIT_TERMINAL_PROMPT: '0',
   GCM_INTERACTIVE: 'never',
-  GIT_ASKPASS: '/bin/false',
+  GIT_ASKPASS: process.env.GBRAIN_GIT_ASKPASS?.trim() || '/bin/false',
   SSH_ASKPASS: '/bin/false',
 } as const;
 
